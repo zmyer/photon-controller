@@ -1,0 +1,82 @@
+{
+  "variables": {
+    "source_ova": "{{env `SOURCE_OVA`}}",
+    "kubernetes_version": "{{env `KUBERNETES_VERSION`}}"
+  },
+  "builders": [
+    {
+      "type": "virtualbox-ovf",
+      "format": "ova",
+      "source_path": "{{ user `source_ova` }}",
+      "ssh_username": "root",
+      "ssh_password": "changeme",
+      "shutdown_command": "echo 'packer' | shutdown -P now",
+      "headless": true,
+      "guest_additions_mode": "disable",
+      "output_directory": "build/",
+      "vm_name": "kubernetes-virtualbox",
+      "vboxmanage": [
+        [ "modifyvm", "{{.Name}}", "--memory", "2048" ],
+        [ "modifyvm", "{{.Name}}", "--cpus", "2" ]
+      ]
+    }
+  ],
+  "provisioners": [
+    {
+      "type": "file",
+      "source": "kube-deploy/docker-multinode",
+      "destination": "/root/docker-multinode"
+    },
+    {
+      "type": "file",
+      "source": "build-scripts",
+      "destination": "/tmp/scripts"
+    },
+    {
+      "type": "file",
+      "source": "kubectl",
+      "destination": "/root/kubectl"
+    },
+    {
+      "type": "shell",
+      "inline": ["sudo chmod +x /root/kubectl"]
+    },
+    {
+      "type": "shell",
+      "inline": "/tmp/scripts/setup-network.sh"
+    },
+    {
+      "type": "file",
+      "source": "service/docker-bootstrap.service",
+      "destination": "/lib/systemd/system/docker-bootstrap.service"
+    },
+    {
+      "type": "shell",
+      "inline": "/tmp/scripts/setup-docker.sh {{ user `kubernetes_version` }}"
+    },
+    {
+      "type": "shell",
+      "inline": "/tmp/scripts/setup-root-user.sh"
+    },
+    {
+      "type": "file",
+      "source": "vm-scripts/setup-dhcp.sh",
+      "destination": "/root/setup-dhcp.sh"
+    },
+    {
+      "type": "file",
+      "source": "../scripts/check-docker.sh",
+      "destination": "/root/check-docker.sh"
+    },
+    {
+      "type": "file",
+      "source": "../scripts/setup-static-ip.sh",
+      "destination": "/root/setup-static-ip.sh"
+    },
+    {
+      "type": "file",
+      "source": "../scripts/copy-ca-cert.sh",
+      "destination": "/root/copy-ca-cert.sh"
+    }
+  ]
+}

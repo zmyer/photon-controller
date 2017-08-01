@@ -10,13 +10,22 @@
       "guest_additions_mode": "disable",
       "shutdown_command": "shutdown -P now",
       "headless": true,
-      "output_directory": "build/"
+      "output_directory": "build/",
+      "vboxmanage": [
+        ["modifyvm", "{{.Name}}", "--nic2", "nat"],
+        ["modifyvm", "{{.Name}}", "--cableconnected2", "on"]
+      ]
     }
   ],
   "provisioners": [
     {
+      "type": "file",
+      "source": "photon",
+      "destination": "/etc"
+    },
+    {
       "type": "shell",
-      "inline": "tdnf makecache"
+      "inline": "tdnf update -y tdnf && tdnf update -y rpm && tdnf makecache"
     },
     {
       "type": "shell",
@@ -24,11 +33,7 @@
     },
     {
       "type": "shell",
-      "inline": "mkdir -p /usr/local/sbin && wget -nv {{ user `dnsmasq_url` }} -O /usr/local/sbin/dnsmasq && chmod +x /usr/local/sbin/dnsmasq"
-    },
-    {
-      "type": "shell",
-      "inline": "wget -nv {{ user `dnsmasq_dhcp_release_url` }} -O /usr/local/bin/dhcp_release && chmod +x /usr/local/bin/dhcp_release"
+      "inline": "tdnf -y install dnsmasq"
     },
     {
       "type": "shell",
@@ -37,6 +42,18 @@
     {
       "type": "shell",
       "inline": "systemctl restart systemd-networkd"
+    },
+    {
+      "type": "shell",
+      "inline": "sed -i 's/DROP/ACCEPT/g' /etc/systemd/scripts/iptables"
+    },
+    {
+      "type": "shell",
+      "inline": "systemctl enable iptables"
+    },
+    {
+      "type": "shell",
+      "inline": "systemctl start iptables"
     },
     {
       "type": "shell",
@@ -50,6 +67,33 @@
     {
       "type": "shell",
       "inline": "tar xf /usr/local/dhcp-agent/dhcp-agent.tar --strip-components=1 -C /usr/local/dhcp-agent && rm /usr/local/dhcp-agent/dhcp-agent.tar"
+    },
+    {
+      "type": "file",
+      "source": "service/configure-guest.service",
+      "destination": "/lib/systemd/system/configure-guest.service"
+    },
+    {
+      "type": "shell",
+      "inline": "systemctl enable configure-guest"
+    },
+    {
+      "type": "file",
+      "source": "service/dnsmasq.service",
+      "destination": "/lib/systemd/system/dnsmasq.service"
+    },
+    {
+      "type": "shell",
+      "inline": "systemctl enable dnsmasq"
+    },
+    {
+      "type": "file",
+      "source": "service/dhcp-agent.service",
+      "destination": "/lib/systemd/system/dhcp-agent.service"
+    },
+    {
+      "type": "shell",
+      "inline": "systemctl enable dhcp-agent"
     },
     {
       "type": "shell",

@@ -1,0 +1,21 @@
+.gradle
+.gradletasknamecache
+build
+out
+target
+tags
+libthrift-*.jar
+
+# IDEA
+*.iml
+*.ipr
+*.iws
+*.ids
+.idea/
+
+# Eclipse
+.project
+.settings
+.classpath
+.checkstyle
+bin

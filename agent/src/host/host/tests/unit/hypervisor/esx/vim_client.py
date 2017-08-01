@@ -1,0 +1,588 @@
+# Copyright 2015 VMware, Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License.  You may obtain a copy
+# of the License at http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, without
+# warranties or conditions of any kind, EITHER EXPRESS OR IMPLIED.  See the
+# License for then specific language governing permissions and limitations
+# under the License.
+
+"""Wrapper around VIM API and Service Instance connection"""
+
+import httplib
+import logging
+import socket
+import struct
+
+import os
+import sys
+import threading
+import time
+
+from common.lock import lock_with
+
+from gen.agent.ttypes import TaskState
+from gen.host.ttypes import VmNetworkInfo
+from gen.host.ttypes import ConnectedStatus
+from gen.host.ttypes import Ipv4Address
+from host.hypervisor.esx.host_client import DeviceBusyException
+from host.hypervisor.esx.host_client import HostdConnectionFailure
+from host.hypervisor.esx.host_client import NfcLeaseInitiatizationTimeout
+from host.hypervisor.esx.host_client import NfcLeaseInitiatizationError
+from host.hypervisor.esx.path_util import os_to_datastore_path
+from host.hypervisor.esx.path_util import is_persistent_disk
+from host.hypervisor.exceptions import DiskAlreadyExistException
+from host.hypervisor.exceptions import DiskPathException
+from host.hypervisor.exceptions import DiskFileException
+from host.hypervisor.exceptions import VmPowerStateException
+from host.hypervisor.exceptions import OperationNotAllowedException
+from host.hypervisor.exceptions import VmAlreadyExistException
+from host.hypervisor.exceptions import VmNotFoundException
+from host.tests.unit.hypervisor.esx.vim_cache import SyncVimCacheThread
+from host.tests.unit.hypervisor.esx.vim_cache import VimDatastore
+from host.tests.unit.hypervisor.esx.vim_cache import VimCache
+from host.tests.unit.hypervisor.esx.vm_config import EsxVmConfigSpec
+from host.tests.unit.hypervisor.esx.vm_config import DEFAULT_DISK_ADAPTER_TYPE
+from pysdk import connect
+from pysdk import host
+from pysdk import invt
+from pyVmomi import vim
+from pyVmomi import vmodl
+
+
+# constants from bora/vim/hostd/private/hostdCommon.h
+HA_DATACENTER_ID = "ha-datacenter"
+
+# constants from bora/vim/hostd/solo/inventory.cpp
+DATASTORE_FOLDER_NAME = "datastore"
+VM_FOLDER_NAME = "vm"
+NETWORK_FOLDER_NAME = "network"
+VIM_VERSION = "vim.version.version9"
+VIM_NAMESPACE = "vim25/5.5"
+NFC_VERSION = "nfc.version.version2"
+
+HOSTD_PORT = 443
+NFC_PORT = 902
+DEFAULT_TASK_TIMEOUT = 60 * 60  # one hour timeout
+
+
+class AcquireCredentialsException(Exception):
+    pass
+
+
+class VimClient():
+    """Wrapper class around VIM API calls using Service Instance connection"""
+
+    def __init__(self, auto_sync=True, errback=None, wait_timeout=10, min_interval=1):
+        self._logger = logging.getLogger(__name__)
+        self._logger.info("VimClient init")
+        self._sync_thread = None
+        self._auto_sync = auto_sync
+        self._errback = errback
+        self._wait_timeout = wait_timeout
+        self._min_interval = min_interval
+        self._update_listeners = set()
+        self._lock = threading.Lock()
+        self._task_counter = 0
+        self._vim_cache = None
+
+    def connect_ticket(self, host, ticket):
+        if ticket:
+            try:
+                stub = connect.SoapStubAdapter(host, HOSTD_PORT, VIM_NAMESPACE)
+                self._si = vim.ServiceInstance("ServiceInstance", stub)
+                self._si.RetrieveContent().sessionManager.CloneSession(ticket)
+                self._post_connect()
+            except httplib.HTTPException as http_exception:
+                self._logger.info("Failed to login hostd with ticket: %s" % http_exception)
+                raise AcquireCredentialsException(http_exception)
+
+    def connect_userpwd(self, host, user, pwd):
+        try:
+            self._si = connect.Connect(host=host, user=user, pwd=pwd, version=VIM_VERSION)
+            self._post_connect()
+        except vim.fault.HostConnectFault as connection_exception:
+            self._logger.info("Failed to connect to hostd: %s" % connection_exception)
+            raise HostdConnectionFailure(connection_exception)
+
+    def connect_local(self):
+        username, password = self._acquire_local_credentials()
+        self.connect_userpwd("localhost", username, password)
+
+    def _create_local_service_instance(self):
+        stub = connect.SoapStubAdapter("localhost", HOSTD_PORT)
+        return vim.ServiceInstance("ServiceInstance", stub)
+
+    def _acquire_local_credentials(self):
+        si = self._create_local_service_instance()
+        try:
+            session_manager = si.content.sessionManager
+        except httplib.HTTPException as http_exception:
+            self._logger.info("Failed to retrieve credentials from hostd: %s" % http_exception)
+            raise AcquireCredentialsException(http_exception)
+
+        local_ticket = session_manager.AcquireLocalTicket(userName="root")
+        username = local_ticket.userName
+        password = file(local_ticket.passwordFilePath).read()
+        return username, password
+
+    def _post_connect(self):
+        self._content = self._si.RetrieveContent()
+        if self._auto_sync:
+            # Start syncing vm cache periodically
+            self._start_syncing_cache()
+
+    def disconnect(self):
+        """ Disconnect vim client
+        :param wait: If wait is true, it waits until the sync thread exit.
+        """
+        self._logger.info("vimclient disconnect")
+        self._stop_syncing_cache()
+        try:
+            connect.Disconnect(self._si)
+        except:
+            self._logger.warning("Failed to disconnect vim_client: %s" % sys.exc_info()[1])
+
+    def _start_syncing_cache(self):
+        self._logger.info("Start vim client sync vm cache thread")
+        self._vim_cache = VimCache()
+        self._vim_cache.poll_updates(self)
+        self._sync_thread = SyncVimCacheThread(self, self._vim_cache, self._wait_timeout,
+                                               self._min_interval, self._errback)
+        self._sync_thread.start()
+
+    def _stop_syncing_cache(self):
+        if self._sync_thread:
+            self._sync_thread.stop()
+            self._sync_thread.join()
+
+    @lock_with("_lock")
+    def add_update_listener(self, listener):
+        # Notify the listener immediately since there might have already been some updates.
+        listener.datastores_updated()
+        self._update_listeners.add(listener)
+
+    @lock_with("_lock")
+    def remove_update_listener(self, listener):
+        self._update_listeners.discard(listener)
+
+    @property
+    @lock_with("_lock")
+    def update_listeners(self):
+        return self._update_listeners
+
+    def query_config(self):
+        env_browser = invt.GetEnv(si=self._si)
+        return env_browser.QueryConfigOption("vmx-10", None)
+
+    @property
+    def _property_collector(self):
+        return self._content.propertyCollector
+
+    def _root_resource_pool(self):
+        """Get the root resource pool for this host.
+        :rtype: vim.ResourcePool
+        """
+        return host.GetRootResourcePool(self._si)
+
+    def _vm_folder(self):
+        """Get the default vm folder for this host.
+        :rtype: vim.Folder
+        """
+        return invt.GetVmFolder(si=self._si)
+
+    def host_system(self):
+        return host.GetHostSystem(self._si)
+
+    def _find_by_inventory_path(self, *path):
+        """
+        Finds a managed entity based on its location in the inventory.
+
+        :param path: Inventory path
+        :type path: tuple
+        :rtype: vim.ManagedEntity
+        """
+        dc = (HA_DATACENTER_ID,)
+        # Convert a tuple of strings to a path for use with `find_by_inventory_path`.
+        p = "/".join(p.replace("/", "%2f") for p in dc + path if p)
+        return self._content.searchIndex.FindByInventoryPath(p)
+
+    def get_vm(self, vm_id):
+        """Get the vm reference on a host.
+        :param vm_id: The name of the vm.
+        :rtype A vim vm reference.
+        """
+        vm = self._find_by_inventory_path(VM_FOLDER_NAME, vm_id)
+        if not vm:
+            raise VmNotFoundException("VM '%s' not found on host." % vm_id)
+
+        return vm
+
+    def get_all_datastores(self):
+        """Get all datastores for this host.
+        :rtype: list of vim.Datastore
+        """
+        datastores = []
+        for ds in self._find_by_inventory_path(DATASTORE_FOLDER_NAME).childEntity:
+            datastores.append(VimDatastore(ds))
+        return datastores
+
+    def _get_vms(self):
+        """ Get VirtualMachine from hostd. Use get_vms_in_cache to have a
+        better performance unless you want Vim Object.
+
+        :return: list of vim.VirtualMachine
+        """
+        PC = vmodl.query.PropertyCollector
+        traversal_spec = PC.TraversalSpec(name="folderTraversalSpec", type=vim.Folder, path="childEntity", skip=False)
+        property_spec = PC.PropertySpec(type=vim.VirtualMachine,
+                                        pathSet=["name", "runtime.powerState", "layout.disk", "config"])
+        object_spec = PC.ObjectSpec(obj=self._vm_folder(), selectSet=[traversal_spec])
+        filter_spec = PC.FilterSpec(propSet=[property_spec], objectSet=[object_spec])
+
+        objects = self._property_collector.RetrieveContents([filter_spec])
+        return [object.obj for object in objects]
+
+    def get_vms_in_cache(self):
+        """ Get information of all VMs from cache.
+
+        :return: list of VmCache
+        """
+        return self._vim_cache.get_vms_in_cache()
+
+    def get_vm_in_cache(self, vm_id):
+        """ Get information of a VM from cache. The vm state is not
+        guaranteed to be up-to-date. Also only name and power_state is
+        guaranteed to be not None.
+
+        :return: VmCache for the vm that is found
+        :raise VmNotFoundException when vm is not found
+        """
+        return self._vim_cache.get_vm_in_cache(vm_id)
+
+    def create_vm_spec(self, vm_id, datastore, memoryMB, cpus, metadata, env):
+        spec = EsxVmConfigSpec(self.query_config())
+        spec.init_for_create(vm_id, datastore, memoryMB, cpus, metadata, env)
+        return spec
+
+    def create_vm(self, vm_id, create_spec):
+        """Create a new Virtual Maching given a VM create spec.
+
+        :param vm_id: The Vm id
+        :type vm_id: string
+        :param create_spec: EsxVmConfigSpec
+        :type ConfigSpec
+        :raise: VmAlreadyExistException
+        """
+        # sanity check since VIM does not prevent this
+        try:
+            if self.get_vm_in_cache(vm_id):
+                raise VmAlreadyExistException("VM already exists")
+        except VmNotFoundException:
+            pass
+
+        folder = self._vm_folder()
+        resource_pool = self._root_resource_pool()
+        spec = create_spec.get_spec()
+        # The scenario of the vm creation at ESX where intermediate directory
+        # has to be created has not been well exercised and is known to be
+        # racy and not informative on failures. So be defensive and proactively
+        # create the intermediate directory ("/vmfs/volumes/<dsid>/vm_xy").
+        try:
+            self.make_directory(spec.files.vmPathName)
+        except vim.fault.FileAlreadyExists:
+            self._logger.debug("VM directory %s exists, will create VM using it" % spec.files.vmPathName)
+
+        task = folder.CreateVm(spec, resource_pool, None)
+        self.wait_for_task(task)
+        self.wait_for_vm_create(vm_id)
+
+    def get_networks(self):
+        return [network.name for network
+                in self._find_by_inventory_path(NETWORK_FOLDER_NAME).childEntity]
+
+    def create_disk(self, path, size):
+        spec = vim.VirtualDiskManager.FileBackedVirtualDiskSpec()
+        spec.capacityKb = size * (1024 ** 2)
+        spec.diskType = vim.VirtualDiskManager.VirtualDiskType.thin
+        spec.adapterType = DEFAULT_DISK_ADAPTER_TYPE
+
+        try:
+            disk_mgr = self._content.virtualDiskManager
+            vim_task = disk_mgr.CreateVirtualDisk(name=os_to_datastore_path(path), spec=spec)
+            self.wait_for_task(vim_task)
+        except vim.fault.FileAlreadyExists, e:
+            raise DiskAlreadyExistException(e.msg)
+        except vim.fault.FileFault, e:
+            raise DiskFileException(e.msg)
+        except vim.fault.InvalidDatastore, e:
+            raise DiskPathException(e.msg)
+
+    def copy_disk(self, src, dst):
+        vd_spec = vim.VirtualDiskManager.VirtualDiskSpec()
+        vd_spec.diskType = str(vim.VirtualDiskManager.VirtualDiskType.thin)
+        vd_spec.adapterType = str(vim.VirtualDiskManager.VirtualDiskAdapterType.lsiLogic)
+
+        try:
+            disk_mgr = self._content.virtualDiskManager
+            vim_task = disk_mgr.CopyVirtualDisk(sourceName=os_to_datastore_path(src),
+                                                destName=os_to_datastore_path(dst), destSpec=vd_spec)
+            self.wait_for_task(vim_task)
+        except vim.fault.FileAlreadyExists, e:
+            raise DiskAlreadyExistException(e.msg)
+        except vim.fault.FileLocked, e:
+            raise DeviceBusyException(e.msg)
+        except vim.fault.FileFault, e:
+            raise DiskFileException(e.msg)
+        except vim.fault.InvalidDatastore, e:
+            raise DiskPathException(e.msg)
+
+    def move_disk(self, src, dst):
+        try:
+            disk_mgr = self._content.virtualDiskManager
+            vim_task = disk_mgr.MoveVirtualDisk(sourceName=os_to_datastore_path(src),
+                                                destName=os_to_datastore_path(dst))
+            self.wait_for_task(vim_task)
+        except vim.fault.FileAlreadyExists, e:
+            raise DiskAlreadyExistException(e.msg)
+        except vim.fault.FileFault, e:
+            raise DiskFileException(e.msg)
+        except vim.fault.InvalidDatastore, e:
+            raise DiskPathException(e.msg)
+
+    def delete_disk(self, path):
+        try:
+            disk_mgr = self._content.virtualDiskManager
+            vim_task = disk_mgr.DeleteVirtualDisk(name=os_to_datastore_path(path))
+            self.wait_for_task(vim_task)
+        except vim.fault.FileFault, e:
+            raise DiskFileException(e.msg)
+        except vim.fault.InvalidDatastore, e:
+            raise DiskPathException(e.msg)
+
+    def make_directory(self, path):
+        """Make directory using vim.fileManager.MakeDirectory
+        """
+        try:
+            file_mgr = self._content.fileManager
+            file_mgr.MakeDirectory(os_to_datastore_path(path), createParentDirectories=True)
+        except vim.fault.FileAlreadyExists:
+            self._logger.debug("Parent directory %s exists" % path)
+
+    def delete_file(self, path):
+        """Delete directory or file using vim.fileManager.DeleteFile
+        """
+        try:
+            file_mgr = self._content.fileManager
+            vim_task = file_mgr.DeleteFile(os_to_datastore_path(path))
+            self.wait_for_task(vim_task)
+        except vim.fault.FileNotFound:
+            pass
+
+    def move_file(self, src, dest):
+        """Move directory or file using vim.fileManager.MoveFile
+        """
+        file_mgr = self._content.fileManager
+        vim_task = file_mgr.MoveFile(sourceName=os_to_datastore_path(src), destinationName=os_to_datastore_path(dest))
+        self.wait_for_task(vim_task)
+
+    def _power_vm(self, vm_id, op):
+        vm = self.get_vm(vm_id)
+        self._invoke_vm(vm, op)
+
+    def power_on_vm(self, vm_id):
+        self._power_vm(vm_id, "PowerOn")
+
+    def power_off_vm(self, vm_id):
+        self._power_vm(vm_id, "PowerOff")
+
+    def reset_vm(self, vm_id):
+        self._power_vm(vm_id, "Reset")
+
+    def suspend_vm(self, vm_id):
+        self._power_vm(vm_id, "Suspend")
+
+    def _reconfigure_vm(self, vm, spec):
+        self._invoke_vm(vm, "ReconfigVM_Task", spec)
+
+    def delete_vm(self, vm_id, force):
+        vm = self.get_vm(vm_id)
+        if vm.runtime.powerState != 'poweredOff':
+            raise VmPowerStateException("Can only delete vm in state %s" % vm.runtime.powerState)
+
+        if not force:
+            persistent_disks = [
+                disk for disk in vm.layout.disk
+                if is_persistent_disk(disk.diskFile)
+            ]
+            if persistent_disks:
+                raise OperationNotAllowedException("persistent disks attached")
+
+        vm_dir = os.path.dirname(vm.config.files.vmPathName)
+        self._logger.info("Destroy VM at %s" % vm_dir)
+        self._invoke_vm(vm, "Destroy")
+        self._vim_cache.wait_for_vm_delete(vm_id)
+
+        return vm_dir
+
+    def _wait_for_lease(self, lease):
+        retries = 10
+        state = None
+        while retries > 0:
+            state = lease.state
+            if state != vim.HttpNfcLease.State.initializing:
+                break
+            retries -= 1
+            time.sleep(1)
+
+        if retries == 0:
+            self._logger.debug("Nfc lease initialization timed out")
+            raise NfcLeaseInitiatizationTimeout()
+        if state == vim.HttpNfcLease.State.error:
+            self._logger.debug("Fail to initialize nfc lease: %s" % str(lease.error))
+            raise NfcLeaseInitiatizationError()
+
+    def wait_for_task(self, vim_task, timeout=DEFAULT_TASK_TIMEOUT):
+        if not self._auto_sync:
+            raise Exception("wait_for_task only works when auto_sync=True")
+
+        self._task_counter_add()
+
+        self._logger.debug("wait_for_task: {0} Number of current tasks: {1}".
+                           format(str(vim_task), self._task_counter_read()))
+
+        try:
+            task_cache = self._vim_cache.wait_for_task(vim_task, timeout)
+        finally:
+            self._task_counter_sub()
+
+        self._logger.debug("task(%s) finished with: %s" % (str(vim_task), str(task_cache)))
+        if task_cache.state == TaskState.error:
+            if not task_cache.error:
+                task_cache.error = "No message"
+            raise task_cache.error
+        else:
+            return task_cache
+
+    @lock_with("_lock")
+    def _task_counter_add(self):
+        self._task_counter += 1
+
+    @lock_with("_lock")
+    def _task_counter_sub(self):
+        self._task_counter -= 1
+
+    @lock_with("_lock")
+    def _task_counter_read(self):
+        return self._task_counter
+
+    def wait_for_vm_create(self, vm_id):
+        """Wait for vm to be created in cache
+        :raise TimeoutError when timeout
+        """
+        self._vim_cache.wait_for_vm_create(vm_id)
+
+    def _vm_op_to_requested_state(self, op):
+        """ Return the string of a requested state from a VM op.
+        """
+        if op == "PowerOn":
+            return "poweredOn"
+        elif op == "PowerOff":
+            return "poweredOff"
+        elif op == "Suspend":
+            return "suspended"
+        else:
+            return "unknown"
+
+    def _invoke_vm(self, vm, op, *args):
+        try:
+            self._logger.debug("Invoking '%s' for VM '%s'" % (op, vm.name))
+            task = getattr(vm, op)(*args)
+            self.wait_for_task(task)
+        except vim.fault.InvalidPowerState, e:
+            if e.existingState == self._vm_op_to_requested_state(op):
+                self._logger.info("VM %s already in %s state, %s successful." %
+                                  (vm.name, e.existingState, op))
+                pass
+            else:
+                self._logger.info("Exception: %s" % e.msg)
+                raise VmPowerStateException(e.msg)
+
+    def get_vm_networks(self, vm_id):
+        """ Get the vm's network information
+        We only report ip info if vmware tools is running within the guest.
+        If tools are not running we can only report back the mac address
+        assigned by the vmx, the connected status of the device and the network
+        attached to the device.
+        The information for mac, networkname and connected status is available
+        through two places, the ethernetCards backing info and through the
+        guestInfo. Both of these codepaths are not using VimVigor and seem to
+        be implemented in a similar manner in hostd, so they should agree with
+        each other. Just read this from the guestInfo as well.
+        """
+        network_info = []
+
+        vm = self.get_vm(vm_id)
+
+        if vm.guest and vm.guest.net:
+            for guest_nic_info in vm.guest.net:
+                if guest_nic_info.macAddress is None:
+                    # No mac address no real guest info. Not possible to have mac
+                    # address not reported but ip stack info available.
+                    continue
+
+                info = VmNetworkInfo(mac_address=guest_nic_info.macAddress)
+                # Fill in the connected status.
+                if guest_nic_info.connected:
+                    info.is_connected = ConnectedStatus.CONNECTED
+                else:
+                    info.is_connected = ConnectedStatus.DISCONNECTED
+
+                # Fill in the network binding info
+                if guest_nic_info.network is not None:
+                    info.network = guest_nic_info.network
+
+                # See if the ip information is available.
+                if guest_nic_info.ipConfig is not None:
+                    ip_addresses = guest_nic_info.ipConfig.ipAddress
+                    for ip_address in ip_addresses:
+                        if self._is_ipv4_address(ip_address.ipAddress):
+                            netmask = self._prefix_len_to_mask(ip_address.prefixLength)
+                            info.ip_address = Ipv4Address(ip_address=ip_address.ipAddress, netmask=netmask)
+                            break
+                network_info.append(info)
+
+        elif vm.config and vm.config.hardware.device:
+            for device in vm.config.hardware.device:
+                if (isinstance(device, vim.vm.device.VirtualEthernetCard) and
+                        isinstance(device.backing, vim.vm.device.VirtualEthernetCard.NetworkBackingInfo)):
+                    info = VmNetworkInfo(mac_address=device.macAddress, network=device.backing.deviceName)
+                    network_info.append(info)
+        return network_info
+
+    @staticmethod
+    def _is_ipv4_address(ip_address):
+        """Utility method to check if an ip address is ipv4
+        :param ip_addres: string ip address
+        :rtype: bool, return True if the ip_address is a v4 address
+        """
+        try:
+            socket.inet_aton(ip_address)
+        except socket.error:
+            return False
+        return ip_address.count('.') == 3
+
+    @staticmethod
+    def _prefix_len_to_mask(prefix_len):
+        """Utility method to convert prefix length to netmask IpV4address pkg is not available on esx.
+        :param prefix_len: int prefix len
+        :rtype: string, string representation of the netmask
+        """
+        if (prefix_len < 0 or prefix_len > 32):
+            raise ValueError("Invalid prefix length")
+        mask = (1L << 32) - (1L << 32 >> prefix_len)
+
+        return socket.inet_ntoa(struct.pack('>L', mask))

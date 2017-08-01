@@ -22,10 +22,11 @@ SOURCES_DIR="${ROOT}/artifacts/rpms/SOURCES"
 SPECS_DIR="${ROOT}/artifacts/rpms/SPECS"
 RPMS_DIR="${ROOT}/artifacts/build/RPMS"
 TEMP_DIR=$(mktemp -d "${ROOT}/create_tar.XXXXX")
-TAR_PATH="/java/photon-controller-core/build/distributions/"
+TAR_PATH="/controller/photon-controller-core/build/distributions/"
 TAR_PREFIX="photon-controller-core"
 RPM_PREFIX="photon-controller"
-ENVOY_VIB_URL=${ENVOY_VIB_URL:="http://artifactory.ec.eng.vmware.com/artifactory/esxcloud-archives/envoy/${BRANCH}/latest/vmware-envoy-latest.vib"}
+ENVOY_VIB_URL=${ENVOY_VIB_URL:="http://s3.amazonaws.com/photon-platform/artifacts/vibs/envoy/develop/latest/vmware-envoy-latest.vib"}
+LIGHTWAVE_VIB_URL=${LIGHTWAVE_VIB_URL:="http://s3.amazonaws.com/photon-platform/artifacts/vibs/lightwave/develop/latest/VMware-lightwave-esx-latest.vib"}
 
 trap "rm -rf ${TEMP_DIR}; rm -rf ${SOURCES_DIR};" EXIT
 
@@ -46,23 +47,29 @@ tar -czf "${SOURCES_DIR}/${RPM_DIR}.tar" "${RPM_DIR}"
 
 cp "${SPECS_DIR}"/* "${SOURCES_DIR}"
 
-# Download pre-build ENVOY vib from artifactory. Ignore if not found, in the case when branches do not match in the URL.
-wget "${ENVOY_VIB_URL}" -P "${SOURCES_DIR}" || true
+# Download pre-build ENVOY and LIGHTWAVE vibs from artifactory.
+wget "${ENVOY_VIB_URL}" -P "${SOURCES_DIR}"
+wget "${LIGHTWAVE_VIB_URL}" -P "${SOURCES_DIR}"
 
 # Build the Photon-Controller vib from local repo and copy to SROUCES folder
 cd "${ROOT}"
 
-docker pull vmware/photon-controller-rpm-builder
+# this will allow us to provide a different possibly signed vib
+if [ -z "$VIB_PATH" ]; then
+  docker pull vmware/photon-controller-rpm-builder
 
-docker run -i --rm \
-  --net=host \
-  -v `pwd`:`pwd` \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -w `pwd`/python \
-  vmware/photon-controller-rpm-builder \
-  make clean vib-only
+  docker run -i --rm \
+    --net=host \
+    -v `pwd`:`pwd` \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -w `pwd`/agent \
+    vmware/photon-controller-rpm-builder \
+    make clean vib-only
 
-cp "${ROOT}"/python/dist/* "${SOURCES_DIR}"
+  cp "${ROOT}"/agent/dist/* "${SOURCES_DIR}"
+else
+  cp ${VIB_PATH} ${SOURCES_DIR}
+fi
 
 DEBUG_OPTIONS=""
 if [ "$DEBUG" == "true" ]; then
@@ -74,6 +81,7 @@ fi
 docker pull vmware/photon-controller-rpm-builder
 docker run -i --rm ${DEBUG_OPTIONS} \
   --net=host \
+  -e GERRIT_BRANCH=${BRANCH} \
   -v "${ROOT}":/photon-controller \
   -v "${SOURCES_DIR}":/usr/src/photon/SOURCES \
   -v "${RPMS_DIR}":/usr/src/photon/RPMS \
@@ -86,4 +94,4 @@ docker run -i --rm \
   --net=host \
   -v "${ROOT}"/artifacts/build/RPMS/x86_64:/rpms \
   vmware/photon-controller-rpm-builder \
-  bash -c 'ls /rpms/photon-controller*.rpm | xargs rpm -Uvh && [ -d /usr/lib/esxcloud/photon-controller-core ]'
+  bash -c 'tdnf install -y vmware-lightwave-clients;ls /rpms/photon-controller*.rpm | xargs rpm -Uvh && [ -d /usr/lib/esxcloud/photon-controller-core ]'

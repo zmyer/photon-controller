@@ -26,14 +26,11 @@ cscope.out
 cscope.po.out
 tags
 
-
 .ruby
 *.gem
 
 tmp/
-ruby/common/test_files/deployment/dcmap.yml
-
-*.gem
+tests/common/test_files/deployment/dcmap.yml
 
 #image building related
 **/build/
@@ -45,6 +42,11 @@ ruby/common/test_files/deployment/dcmap.yml
 *.ova
 *.iso
 *.box
+*.rpm
 .vagrant
 .bundle
-java/containers/photon-controller-core/*.rpm
+
+*.log
+
+# netbeans
+/controller/.nb-gradle/
